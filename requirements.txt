@@ -1,0 +1,96 @@
+# requirements.txt
+# JvX Nexus -- production dependencies.
+#
+# Versions below are MINIMUM floors (>=), not exact pins, and were checked
+# against PyPI as of July 2026 (search results, not training-data recall --
+# my training cutoff is January 2026, six months before this file was
+# written, which is long enough for these fast-moving packages to have
+# moved). Confirmed current at write time: fastapi (0.136.x line),
+# sqlalchemy (2.0.51, uploaded Jun 2026). Not individually re-verified this
+# way: uvicorn, pydantic-settings, psycopg2-binary, python-dotenv, PyJWT,
+# cryptography, passlib -- their floors below are reasonable but less
+# rigorously checked, and it's genuinely possible newer minors exist by the
+# time this is installed.
+#
+# For actual production use: install with these floors, then run
+# `pip freeze > requirements.lock.txt` (or use pip-tools / uv / poetry) to
+# capture exact resolved versions for reproducible builds. Minimum-version
+# constraints are the right choice for a template like this one -- they
+# won't fail to install over an exact-pin guess that's since gone stale --
+# but they are NOT a substitute for a real lockfile before this goes into
+# the stress test or production.
+
+# --- Web framework & server ---
+fastapi>=0.136.0
+uvicorn[standard]>=0.34.0
+
+# --- Database ---
+sqlalchemy>=2.0.51
+psycopg2-binary>=2.9.9
+# psycopg2-binary (not psycopg2) is the batteries-included build -- no
+# separate libpq/system dependency to compile against. Fine for this
+# stress test and most deployments; the non-binary psycopg2 build is the
+# usual recommendation for a fully from-source production image, at the
+# cost of needing the Postgres client dev headers available at build time.
+
+# --- Settings & validation ---
+pydantic>=2.12.0
+pydantic-settings>=2.7.0
+python-dotenv>=1.0.1
+# pydantic-settings uses python-dotenv internally to read env_file in
+# SettingsConfigDict -- listed explicitly here rather than left as an
+# implicit transitive dependency.
+
+# --- Security ---
+pyjwt>=2.9.0
+cryptography>=43.0.0
+passlib[bcrypt]>=1.7.4
+# passlib itself has seen little active development in the last couple of
+# years -- worth knowing, not necessarily a reason to avoid it, since the
+# bcrypt backend it wraps (via the bcrypt package, pulled in by the
+# [bcrypt] extra) is what's actually doing the cryptographic work and that
+# IS still maintained. Flagging so it's a known tradeoff, not a surprise
+# later.
+pyotp>=2.9.0
+# TOTP (RFC 6238) generation/verification for MFA. Floor is a reasonable,
+# conservative baseline, NOT freshly re-checked against PyPI this pass --
+# pyotp is a small, stable, infrequently-changing library, lower risk than
+# most entries here even without a fresh version check.
+
+# --- External integrations ---
+# All four of these were verbally flagged as needed across earlier turns
+# (Google Sign-In, Decentro, MFA discussion, and now the compliance-engine
+# rewrite) but never actually landed in this file until this pass --
+# caught during this turn's GTM readiness audit specifically because it
+# checked the file itself rather than trusting earlier chat responses that
+# said "add this."
+requests>=2.32.0
+# Used by services/compliance_engine.py (Cashfree, ComplyAdvantage),
+# services/bank_onboarding_client.py (Decentro), and, as of the Pillar 2/3
+# build, services/adsense_client.py (Google OAuth token exchange + AdSense
+# Management API) and services/client_risk_providers.py (RDAP, Companies
+# House, GLEIF, Google Web Risk). One shared HTTP dependency across every
+# external integration in this codebase -- nothing new to add here for
+# either pillar, just more callers of the same library.
+google-auth>=2.35.0
+# Used by api/auth_routes.py's Google Sign-In verification.
+boto3>=1.35.0
+# Used by services/compliance_engine.py's AWS Textract invoice OCR call.
+# Also requires real AWS credentials available to boto3's standard
+# resolution chain (environment variables, ~/.aws/credentials, or an IAM
+# role) -- not a pip-installable concern, but nothing in this file alone
+# makes Textract calls succeed.
+# Floors for requests/google-auth/boto3, like pyotp above, are reasonable
+# conservative baselines, not individually re-verified against PyPI this
+# pass -- same disclosure as uvicorn/pydantic-settings/etc. noted at the
+# top of this file.
+
+# --- Pillar 3 (ClientShield) ---
+dnspython>=2.7.0
+# Used by services/client_risk_providers.py's check_mx_record -- the one
+# genuinely new third-party dependency introduced by either pillar; every
+# other Pillar 2/3 external call reuses `requests`, already listed above.
+# Current PyPI release is 2.8.0 (confirmed via direct check, not recalled
+# from training data), which requires Python 3.10+. Floor set to 2.7.0
+# instead (Python 3.9+) as a safer minimum in case your local interpreter
+# is older -- if you're on 3.10+, feel free to bump this to >=2.8.0.
