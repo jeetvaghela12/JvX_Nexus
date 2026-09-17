@@ -1,29 +1,16 @@
 """
 API: b2b_routes.py
-Exposes strictly authenticated B2B endpoints (like the Nostro Bank Webhook).
 
-SIGNATURE VERIFICATION ORDERING: request.body() is read and checked
-against x_signature BEFORE anything touches JSON -- that ordering is the
-entire point of the Payload Injection Guard rule, not an implementation
-detail. A route parameter typed as a Pydantic model or plain dict would
-make FastAPI parse the JSON body automatically before this function even
-runs, which would put verification (if it happened at all) after parsing
--- exactly backwards, and exactly what a forged/tampered payload would
-need to slip past signature checking. Using `request: Request` instead of
-a typed body parameter is what keeps that from happening; don't
-"simplify" this by adding a typed body parameter later without moving the
-signature check somewhere upstream of it.
+Endpoints the partner bank calls. Not the customer — the bank's own
+systems.
 
-RawWebhookLog NOTE: the earlier decision was to log 100% of raw incoming
-payloads to a RawWebhookLog (or NoSQL dump) at this layer before calling
-process_bank_signal, marking it FAILED on UnrecognizedAccountError, so
-unmatched signals stay auditable without a nullable user_id on the
-ledger. That isn't implemented in this file -- there's no RawWebhookLog
-model yet to write to, and today's instructions didn't ask for it here.
-Flagging rather than skipping silently: this route is complete against
-what was actually asked this turn, but the audit-trail decision from two
-turns ago isn't realized until that model (and this route's write to it)
-both exist.
+SIGNATURE ORDERING IS LOAD-BEARING. The raw body is read and verified
+before anything parses JSON. This is why the routes below take
+`request: Request` rather than a typed Pydantic body: a typed parameter
+makes FastAPI parse the body before the function runs, which puts
+verification after parsing — exactly backwards, and exactly the gap a
+forged payload needs. Do not "simplify" this by adding a typed body
+parameter without moving verification upstream of it.
 """
 import hashlib
 import hmac
@@ -35,229 +22,160 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from core.config import settings
 from core.database import get_db
-from services.bank_onboarding_client import get_virtual_account_provider
-from services.bank_webhook import WebhookProcessingError, process_bank_signal, trigger_settlement_dispatch
+from services.bank_webhook import (
+    WebhookProcessingError,
+    apply_status_update,
+    process_bank_signal,
+)
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/b2b", tags=["B2B Webhooks"])
+router = APIRouter(prefix="/b2b", tags=["Bank Integration"])
 
 
-class BankWebhookResponse(BaseModel):
-    transaction_reference: str
+class PaymentSignalResponse(BaseModel):
+    bank_reference: str
     status: str
     was_duplicate: bool
+    matched_declaration: str | None
 
 
-def _verify_hmac_signature_mock(raw_body: bytes, signature: str) -> bool:
+class StatusUpdateResponse(BaseModel):
+    bank_reference: str
+    status: str
+
+
+def _verify_signature(raw_body: bytes, signature: str) -> bool:
     """
-    MOCK -- stands in for real HMAC-SHA256 verification of the webhook
-    payload. There's no settings.BANK_WEBHOOK_HMAC_SECRET in config.py
-    yet, so there's no real secret to check against.
+    HMAC-SHA256 over the raw request body.
 
-    Real implementation, once that setting exists:
+    hmac.compare_digest, never ==. A plain string comparison returns as
+    soon as it finds a mismatched byte, and the time that takes tells an
+    attacker how many leading bytes were right. Repeated, that recovers a
+    valid signature one byte at a time. compare_digest takes the same time
+    regardless of where the first difference is.
 
-        expected = hmac.new(
-            settings.BANK_WEBHOOK_HMAC_SECRET.get_secret_value().encode("utf-8"),
-            raw_body,
-            hashlib.sha256,
-        ).hexdigest()
-        return hmac.compare_digest(expected, signature)
-
-    hmac.compare_digest specifically, never == : a plain string comparison
-    short-circuits on the first mismatched byte, which leaks timing
-    information an attacker can use to infer the correct signature one
-    byte at a time (a timing attack). That detail matters for the real
-    implementation regardless of what this mock does below -- verified
-    the snippet above actually works correctly (accepts a valid signature,
-    rejects a tampered body) before writing it into this docstring.
-
-    For now: deterministic and honest about being fake. Rejects only the
-    unambiguously-invalid case (empty/whitespace signature header) and
-    accepts everything else, since there's no real secret configured yet
-    to check against. This keeps the 401 path genuinely reachable (send
-    an empty signature) without needing a test-only parameter a real
-    caller couldn't produce.
+    An unconfigured secret rejects everything rather than accepting
+    everything. A misconfiguration should fail closed and be obvious in
+    the logs, not silently disable authentication on the one endpoint that
+    accepts instructions from outside.
     """
-    return bool(signature and signature.strip())
+    secret = settings.BANK_WEBHOOK_HMAC_SECRET
+    if not secret:
+        logger.error(
+            "BANK_WEBHOOK_HMAC_SECRET is not configured. Rejecting all webhook traffic."
+        )
+        return False
+
+    if not signature or not signature.strip():
+        return False
+
+    expected = hmac.new(
+        secret.get_secret_value().encode("utf-8"),
+        raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+
+    return hmac.compare_digest(expected, signature.strip())
 
 
-@router.post("/bank-webhook", response_model=BankWebhookResponse)
-async def handle_bank_webhook(
-    request: Request,
-    response: Response,
-    x_idempotency_key: str = Header(...),
-    x_signature: str = Header(...),
-    db: Session = Depends(get_db),
-) -> BankWebhookResponse:
+async def _read_verified_payload(request: Request, signature: str) -> dict:
     """
-    Receives the raw webhook from the partner bank, verifies its
-    signature, and hands the parsed payload to process_bank_signal.
+    Read the raw body, verify it, and only then parse.
 
-    x_idempotency_key / x_signature map to X-Idempotency-Key /
-    X-Signature via FastAPI's standard underscore-to-hyphen header
-    convention -- no explicit alias needed.
+    parse_float=Decimal so that a bare numeric literal in the JSON becomes
+    a Decimal directly and never passes through float. An amount that
+    round-trips through a float has already lost precision before any of
+    our code sees it, and no amount of careful Decimal handling downstream
+    recovers it.
     """
-    # 1. Raw bytes first. Nothing below this line touches JSON until the
-    #    signature is verified against these exact bytes.
     raw_body = await request.body()
 
-    # 2. Verify BEFORE parsing -- see module docstring for why this
-    #    ordering is load-bearing, not stylistic.
-    if not _verify_hmac_signature_mock(raw_body, x_signature):
+    if not _verify_signature(raw_body, signature):
         raise HTTPException(status_code=401, detail="Invalid webhook signature.")
 
-    # 3. Only now parse JSON. parse_float=Decimal so a bare numeric
-    #    literal in the body becomes Decimal directly, never float --
-    #    this is the upstream fix bank_webhook.py's own docstring flags
-    #    as the real solution; the Decimal(str(x)) fallback there is now
-    #    defensive redundancy rather than the primary safeguard.
     try:
-        payload = json.loads(raw_body, parse_float=Decimal)
+        return json.loads(raw_body, parse_float=Decimal)
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=400, detail=f"Malformed JSON body: {exc}") from exc
 
-    # 4. Hand off to the business service.
+
+@router.post("/payment-signal", response_model=PaymentSignalResponse)
+async def receive_payment_signal(
+    request: Request,
+    response: Response,
+    x_bank_reference: str = Header(...),
+    x_signature: str = Header(...),
+    db: Session = Depends(get_db),
+) -> PaymentSignalResponse:
+    """
+    The bank tells us money arrived in one of its virtual accounts.
+
+    Returns 201 for a newly recorded payment, 200 for a replay of one
+    already held. Banks redeliver — on timeout, on retry, on an operator
+    pressing resend — and a replay is a normal event, not an error. The
+    status code is the only difference the bank needs to see.
+    """
+    payload = await _read_verified_payload(request, x_signature)
+
     try:
-        result = process_bank_signal(db=db, payload=payload, idempotency_key=x_idempotency_key)
+        result = process_bank_signal(
+            db=db, payload=payload, bank_reference=x_bank_reference.strip()
+        )
     except WebhookProcessingError as exc:
-        # Catches MalformedPayloadError and UnrecognizedAccountError (both
-        # subclass this) plus any future WebhookProcessingError subclass
-        # bank_webhook.py might gain later, without this route needing an
-        # update every time that happens.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception:
-        # Anything unexpected (DB connectivity, etc.): log it server-side
-        # with the idempotency key for traceability, then let it propagate
-        # -- FastAPI's default handling turns an uncaught exception into a
-        # 500 on its own; this adds the log entry that behavior doesn't.
-        logger.exception("Unexpected failure processing bank webhook (idempotency_key=%s)", x_idempotency_key)
+        logger.exception(
+            "Unexpected failure processing payment signal (bank_reference=%s)",
+            x_bank_reference,
+        )
         raise
 
-    # 5. Dispatch settlement -- reads the (possibly just-created) ledger
-    # row's recipient's preferred_payout_route and routes to CBDC or FIAT
-    # settlement. Skips entirely on a duplicate, and never raises past
-    # this point -- see trigger_settlement_dispatch's own docstring for
-    # why a downstream settlement failure must not turn into a 500
-    # returned to the bank for a webhook that itself succeeded.
-    #
-    # Runs BEFORE the response is built below, on the same db session --
-    # if settlement completes synchronously (the mock always does),
-    # result.ledger_entry.status below will already reflect COMPLETED/
-    # FAILED, not just the PENDING state it had right after creation.
-    # Deliberate, not accidental: a more accurate response is a genuine
-    # improvement, worth calling out explicitly since it's not obvious
-    # from reading this function alone why the status could differ from
-    # what process_bank_signal itself set a few lines up.
-    trigger_settlement_dispatch(db, result)
-
-    # 6. Map the result to the response. 201 for a genuinely new ledger
-    # entry, 200 when this call was a replay of an already-processed
-    # signal -- the idempotency guarantee succeeding, not an error.
     response.status_code = 200 if result.was_duplicate else 201
-    return BankWebhookResponse(
-        transaction_reference=result.ledger_entry.transaction_reference,
-        status=result.ledger_entry.status,
+
+    return PaymentSignalResponse(
+        bank_reference=result.payment.bank_reference,
+        status=result.payment.status,
         was_duplicate=result.was_duplicate,
+        matched_declaration=(
+            result.matched_declaration.reference if result.matched_declaration else None
+        ),
     )
 
 
-class DecentroCallbackAckResponse(BaseModel):
-    """
-    Decentro's own reference page shows only HTTP 200/400 status examples
-    for this callback, not a documented required response body -- most
-    webhook consumers only check the status code for acknowledgment, so
-    this minimal body is a safe default, not a confirmed contract.
-    """
-
-    status: str = "received"
-
-
-@router.post("/decentro-callback", response_model=DecentroCallbackAckResponse)
-async def handle_decentro_balance_callback(
+@router.post("/payment-status", response_model=StatusUpdateResponse)
+async def receive_status_update(
     request: Request,
-    response: Response,
+    x_bank_reference: str = Header(...),
+    x_signature: str = Header(...),
     db: Session = Depends(get_db),
-) -> DecentroCallbackAckResponse:
+) -> StatusUpdateResponse:
     """
-    Decentro-specific counterpart to /bank-webhook above -- a SEPARATE
-    route, not a modification to the generic one, because Decentro's
-    actual callback contract is different in two structural ways,
-    confirmed directly against their documentation: auth is a shared
-    custom header value, not HMAC, and the payload shape has nothing in
-    common with what process_bank_signal expects. This route's whole job
-    is translating Decentro's shape into that existing, already-tested
-    shape and handing off -- process_bank_signal itself is completely
-    untouched by any of this.
+    The bank reports what it did with a payment: credited, held, returned,
+    FIRA issued.
 
-    REGISTRATION IS NOT SELF-SERVICE: this URL needs to actually be
-    registered with Decentro's team by email before they will ever call
-    it (see core/config.py's DECENTRO_WEBHOOK_HEADER_NAME/VALUE comments)
-    -- deploying this code alone does not make Decentro start sending
-    callbacks here.
+    We record the bank's account of its own actions. There is no
+    validation here that a transition is legal, because the bank's systems
+    are the authority on the lifecycle of the bank's payment. A state
+    machine on this side that disagreed would simply be wrong.
     """
-    raw_body = await request.body()
-    headers = dict(request.headers)
-
-    provider = get_virtual_account_provider()
-    if not provider.verify_webhook_signature(headers, raw_body):
-        raise HTTPException(status_code=401, detail="Invalid or missing Decentro callback header.")
+    payload = await _read_verified_payload(request, x_signature)
 
     try:
-        payload = json.loads(raw_body, parse_float=Decimal)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=400, detail=f"Malformed JSON body: {exc}") from exc
-
-    # PUSH-ONLY FILTER: only a Credit callback represents new inbound
-    # funds -- the event this platform's ledger actually models. A Debit
-    # callback (a refund, or Decentro's own settlement sweep out of this
-    # account) is a structurally different event that process_bank_signal
-    # isn't built to record as an incoming transaction; acknowledge it and
-    # stop here rather than forcing it through logic built for the other
-    # case.
-    callback_type = payload.get("type")
-    if callback_type != "Credit":
-        logger.info("Decentro callback type=%s acknowledged, not processed as an inbound transaction.", callback_type)
-        return DecentroCallbackAckResponse()
-
-    idempotency_key = payload.get("callback_txn_id")
-    if not idempotency_key:
-        raise HTTPException(status_code=400, detail="Missing callback_txn_id.")
-
-    # TRANSLATION LAYER -- see this route's docstring. currency and
-    # exchange_rate are hardcoded, not extracted, because Decentro's VA
-    # collections are domestic NEFT/RTGS/IMPS only: there is no FX
-    # component, and Decentro's callback doesn't send either field.
-    # purpose_code is the genuinely awkward one: compliance_purpose_code
-    # (models/ledger_model.py) was designed around FEMA cross-border
-    # purpose codes, which don't have a natural equivalent for a purely
-    # domestic collection. "DOMESTIC_COLLECTION" below is a clearly-
-    # labeled placeholder, not a real code -- worth a deliberate decision
-    # on whether that column's meaning should broaden, or domestic and
-    # cross-border transactions eventually need different handling
-    # entirely, rather than this route quietly deciding that on its own.
-    translated_payload = {
-        "amount": payload.get("amount"),
-        "currency": "INR",
-        "recipient_account": payload.get("payee_account_number"),
-        "exchange_rate": "1.0",
-        "purpose_code": "DOMESTIC_COLLECTION",
-    }
-
-    try:
-        result = process_bank_signal(db=db, payload=translated_payload, idempotency_key=idempotency_key)
+        payment = apply_status_update(
+            db=db, bank_reference=x_bank_reference.strip(), payload=payload
+        )
     except WebhookProcessingError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception:
-        logger.exception("Unexpected failure processing Decentro callback (callback_txn_id=%s)", idempotency_key)
+        logger.exception(
+            "Unexpected failure applying status update (bank_reference=%s)", x_bank_reference
+        )
         raise
 
-    # Settlement dispatch, same as the generic /bank-webhook route above --
-    # deliberately not duplicated logic beyond this one call, since both
-    # routes share trigger_settlement_dispatch rather than each
-    # reimplementing the was_duplicate check and error handling.
-    trigger_settlement_dispatch(db, result)
-
-    response.status_code = 200 if result.was_duplicate else 201
-    return DecentroCallbackAckResponse()
+    return StatusUpdateResponse(
+        bank_reference=payment.bank_reference,
+        status=payment.status,
+    )

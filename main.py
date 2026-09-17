@@ -1,7 +1,13 @@
 """
 main.py
-FastAPI application entry point -- wires CORE, MODELS, SERVICES, and API
-into a single running app.
+FastAPI entry point for RemitCore — the cross-border collections layer
+that runs inside a partner bank's own application.
+
+WHAT THIS SERVICE DOES NOT DO, and must never start doing: hold funds,
+move funds, execute settlement, or contact the bank's customer. The bank
+does all four. This service coordinates KYC and account issuance requests,
+screens invoices, records what the bank reports, and returns compliance
+recommendations the bank is free to ignore.
 """
 import logging
 from collections.abc import AsyncIterator
@@ -10,55 +16,31 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from core.config import settings
 from core.database import Base, engine
 
-# Import every model module so its table registers on Base.metadata BEFORE
-# create_all() runs in the lifespan below. This is NOT redundant with the
-# router imports further down: none of the routers below, directly or
-# transitively, ever import models.compliance_model (RawWebhookLog,
-# CommercialInvoice) -- only user_model, ledger_model, ticket_model, and
-# virtual_account_model reach Base.metadata via the routers/services that
-# use them. virtual_account_model specifically DOES have a transitive
-# path today (services/bank_webhook.py imports it directly, and
-# api/van_routes.py imports it too) -- it's still listed explicitly here
-# rather than relying on that path staying intact, matching this block's
-# own reasoning: a future refactor of either file could quietly remove
-# that import without anyone noticing create_all() had started skipping
-# a table. Without this explicit block, create_all() would silently
-# create every table except compliance_model's two: no error at startup,
-# they'd just never exist, and the first sign of trouble would be a
-# confusing "relation does not exist" the moment something touches either
-# table -- exactly the kind of failure mode worth catching before the
-# stress test, not during it.
-#
-# clientshield_model added alongside the rest for the identical reason:
-# ClientShieldReport is only reached transitively via api/clientshield_routes.py
-# today -- fine right now, but the same "a future refactor could silently
-# stop registering this table" risk applies, so it's listed explicitly
-# here too, not left to rely on that one import path staying intact.
-from models import cbdc_model, clientshield_model, compliance_model, income_model, ledger_model, ticket_model, user_model, virtual_account_model  # noqa: F401
+# Imported for their side effect: each module registers its table on
+# Base.metadata. Without this, create_all() silently skips any table whose
+# model is not reachable from an imported router, and the first symptom is
+# a confusing "relation does not exist" at runtime rather than an error at
+# startup.
+from models import (  # noqa: F401
+    compliance_model,
+    declaration_model,
+    payment_model,
+    user_model,
+    virtual_account_model,
+)
 
 from api.auth_routes import router as auth_router
-from api.kyc_routes import router as kyc_router
-from api.van_routes import router as van_router
-from api.invoice_routes import router as invoice_router
-from api.compliance_routes import router as compliance_router
-from api.payout_routes import router as payout_router
 from api.b2b_routes import router as b2b_router
-from api.support_routes import router as support_router
-from api.v1_routers import router as v1_router
-from api.admin_routes import router as admin_router
-from api.consolidator_routes import router as consolidator_router
-from api.clientshield_routes import router as clientshield_router
+from api.compliance_routes import router as compliance_router
+from api.declaration_routes import router as declaration_router
+from api.invoice_routes import router as invoice_router
+from api.kyc_routes import router as kyc_router
+from api.payment_routes import router as payment_router
+from api.van_routes import router as van_router
 
-# Basic logging config so the logger.exception(...) calls already in the
-# API layer (b2b_routes.py, support_routes.py, v1_routers.py) actually
-# produce readable, leveled output -- without this, Python's logging
-# defaults still surface ERROR-level records via a bare "last resort"
-# handler, but with none of the formatting that makes them useful under
-# real load. Not one of the five things asked for explicitly, but a small,
-# low-risk addition that matters specifically because a stress test is
-# exactly when you need these lines to be legible.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -68,49 +50,43 @@ logging.basicConfig(
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
-    LOCAL TESTING ONLY, per the brief: Base.metadata.create_all() is
-    additive-only -- it issues CREATE TABLE for whatever doesn't exist yet
-    and does nothing to a table that already does, even if that table's
-    corresponding model has since gained new columns. This project's own
-    history is the concrete example: source_currency, base_usd_exchange_
-    rate, status, error_reason, and cbdc_reference_number were all added
-    to TransactionLedger, and kyc_status/preferred_payout_route/etc. to
-    User, well after either table could plausibly have already been
-    created by an earlier run of exactly this call. Against any database
-    that already has these tables, create_all() will NOT retroactively add
-    those columns -- Alembic (or equivalent) migrations are what real
-    schema evolution needs; this call is only ever appropriate against a
-    fresh, disposable database, which is what "local testing" here means.
+    LOCAL DEVELOPMENT ONLY.
+
+    create_all() is additive: it issues CREATE TABLE for what is missing
+    and does nothing to a table that already exists, even if the model has
+    since gained columns. Against a database that already has these
+    tables, a new column will simply never appear, and the failure shows
+    up later as a missing-column error nobody can place.
+
+    Real schema evolution needs Alembic. This call is appropriate only
+    against a fresh, disposable database.
     """
     Base.metadata.create_all(bind=engine)
     yield
 
 
 app = FastAPI(
-    title="JvX Nexus Core",
+    title="RemitCore",
     description=(
-        "Bank-grade infrastructure for cross-border B2B payments, e-Rupee "
-        "settlement, and RBI/FEMA-compliant transaction processing."
+        "Cross-border collections infrastructure for Indian banks. "
+        "Runs inside the bank's application; never holds or moves funds."
     ),
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
-# allow_credentials=False, deliberately, even though "allow all" was asked
-# for: allow_origins=["*"] combined with allow_credentials=True is
-# rejected by browsers outright (the CORS spec forbids a wildcard origin
-# alongside credentialed requests) -- so setting both would either be
-# silently ineffective or break credentialed calls, not actually grant
-# broader access. This app's auth is header-based (x_user_id today, a JWT
-# Authorization header once the planned security-layer integration lands),
-# not cookie-based, so allow_credentials=False doesn't limit anything this
-# app actually relies on. allow_origins=["*"] is still exactly as open as
-# asked -- flagging, as with every other "for now"/mock item this session,
-# that this needs to become a real allowlist of known frontend origins
-# before this is anywhere near production traffic.
+# allow_credentials stays False deliberately. A wildcard origin combined
+# with credentialed requests is rejected by browsers outright, so setting
+# both would not grant broader access — it would break credentialed calls
+# while appearing permissive. Auth here is a bearer token in a header, not
+# a cookie, so nothing this app relies on is affected.
+#
+# The wildcard itself is a development setting. Before this handles a
+# bank's traffic it needs a real allowlist, which is why the origins are
+# read from config rather than hardcoded.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.CORS_ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -120,16 +96,12 @@ app.include_router(auth_router)
 app.include_router(kyc_router)
 app.include_router(van_router)
 app.include_router(invoice_router)
+app.include_router(declaration_router)
+app.include_router(payment_router)
 app.include_router(compliance_router)
-app.include_router(payout_router)
 app.include_router(b2b_router)
-app.include_router(support_router)
-app.include_router(v1_router)
-app.include_router(admin_router)
-app.include_router(consolidator_router)
-app.include_router(clientshield_router)
 
 
-@app.get("/health")
+@app.get("/health", tags=["Ops"])
 async def health_check() -> dict[str, str]:
-    return {"status": "ok", "system": "JvX Nexus Core"}
+    return {"status": "ok", "service": "RemitCore"}

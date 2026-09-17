@@ -125,7 +125,7 @@ class CommercialInvoice(Base):
 
     related_transaction_id: Mapped[int | None] = mapped_column(
         BigInteger,
-        ForeignKey("transaction_ledger.id", ondelete="SET NULL"),
+        ForeignKey("inbound_payments.id", ondelete="SET NULL"),
         index=True,
     )
     # NEW: closes the gap this file's own docstring originally flagged --

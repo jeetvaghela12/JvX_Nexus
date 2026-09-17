@@ -1,9 +1,18 @@
 """
 API: compliance_routes.py
-e-FIRA compliance bundle generation and retrieval -- packaging, for the
-AD-1 bank's own compliance interface, not issuance. See models/
-compliance_model.py's EFiraLog docstring for why that distinction is
-stated explicitly here too, not left implicit.
+
+e-FIRA compliance bundle generation and retrieval.
+
+PACKAGING, NOT ISSUANCE. The bank issues the FIRA. What this builds is a
+tamper-evident bundle — the payment details, the linked invoices, and a
+hash over all of it — that the bank's compliance interface can read when
+it issues the real thing. If this ever starts producing something
+presented to a customer as a FIRA, the product has stepped outside what
+it is allowed to do.
+
+Rewritten to read from InboundPayment. The previous version read from
+TransactionLedger, which belonged to the earlier design where this
+platform moved money and took a cut. That model is gone.
 """
 import logging
 from dataclasses import asdict
@@ -16,7 +25,7 @@ from sqlalchemy.orm import Session
 from core.database import get_db
 from core.dependencies import get_current_user
 from models.compliance_model import CommercialInvoice, EFiraLog
-from models.ledger_model import TransactionLedger
+from models.payment_model import InboundPayment
 from models.user_model import User
 from schemas.compliance_schemas import EFiraBundleResponse, EFiraGenerateRequest
 from services.compliance_engine import generate_efira_bundle
@@ -33,25 +42,43 @@ async def generate_efira_log(
     db: Session = Depends(get_db),
 ) -> EFiraBundleResponse:
     """
-    Generates and persists an e-FIRA compliance bundle for one of the
-    caller's own COMPLETED transactions, optionally linking specific
-    invoices the caller also owns.
+    Build a compliance bundle for one of the caller's own credited
+    payments, optionally linking invoices the caller also owns.
+
+    payload.transaction_id now carries the bank_reference rather than an
+    internal row id. The bank's reference is what appears on the bank's
+    own systems, so it is the identifier a compliance officer can actually
+    look up when they receive this bundle.
     """
-    transaction = db.execute(
-        select(TransactionLedger).where(
-            TransactionLedger.id == payload.transaction_id,
-            TransactionLedger.user_id == current_user.id,
+    payment = db.execute(
+        select(InboundPayment).where(
+            InboundPayment.bank_reference == payload.transaction_id,
+            InboundPayment.user_id == current_user.id,
         )
     ).scalar_one_or_none()
-    if transaction is None:
-        # Uniform 404 for "doesn't exist" and "isn't yours" -- same
-        # ticket-enumeration-prevention reasoning as api/support_routes.py.
-        raise HTTPException(status_code=404, detail="Transaction not found.")
+    if payment is None:
+        # Uniform 404 whether it does not exist or belongs to someone
+        # else. Distinguishing the two confirms to a caller that a
+        # reference they guessed is real.
+        raise HTTPException(status_code=404, detail="Payment not found.")
 
-    if transaction.status != "COMPLETED":
+    if payment.status != "CREDITED":
         raise HTTPException(
             status_code=400,
-            detail=f"Cannot generate an e-FIRA bundle for a transaction with status {transaction.status!r} -- only COMPLETED transactions qualify.",
+            detail=(
+                f"Cannot build a compliance bundle for a payment with status "
+                f"{payment.status!r}. Only CREDITED payments qualify — the bank has "
+                "not yet settled this one."
+            ),
+        )
+
+    if payment.purpose_code is None:
+        # The purpose code is what makes the bundle meaningful to a
+        # compliance officer. Building one without it produces a document
+        # that looks complete and answers nothing.
+        raise HTTPException(
+            status_code=400,
+            detail="This payment has no purpose code assigned yet. The bank confirms the purpose code on settlement.",
         )
 
     invoices: list[CommercialInvoice] = []
@@ -73,11 +100,11 @@ async def generate_efira_log(
             )
 
     bundle_data = generate_efira_bundle(
-        transaction_reference=transaction.transaction_reference,
-        gross_amount=transaction.gross_amount,
-        source_currency=transaction.source_currency,
-        compliance_purpose_code=transaction.compliance_purpose_code,
-        completed_at=transaction.completed_at,
+        transaction_reference=payment.bank_reference,
+        gross_amount=payment.amount,
+        source_currency=payment.currency,
+        compliance_purpose_code=payment.purpose_code,
+        completed_at=payment.updated_at,
         user_full_name=current_user.full_name,
         user_entity_type=current_user.entity_type,
         linked_invoice_storage_keys=[inv.storage_key for inv in invoices],
@@ -85,7 +112,7 @@ async def generate_efira_log(
     )
 
     log_entry = EFiraLog(
-        transaction_id=transaction.id,
+        transaction_id=payment.id,
         bundle_payload=asdict(bundle_data),
         bundle_hash=bundle_data.bundle_hash,
         status="GENERATED",
@@ -95,11 +122,9 @@ async def generate_efira_log(
         db.add(log_entry)
         db.commit()
     except IntegrityError:
-        # bundle_hash's unique=True firing: byte-for-byte identical
-        # content already generated as an earlier bundle. Same class of
-        # race/duplicate handling used throughout this codebase --
-        # database constraint as the actual guarantee, this as the clean
-        # error translation.
+        # bundle_hash is unique: byte-for-byte identical content was
+        # already generated. Database constraint as the guarantee, this
+        # as the readable translation of it.
         db.rollback()
         raise HTTPException(
             status_code=409,
@@ -108,14 +133,18 @@ async def generate_efira_log(
     except Exception:
         db.rollback()
         logger.exception(
-            "Unexpected failure saving e-FIRA bundle (user_id=%s, transaction_id=%s)",
+            "Unexpected failure saving e-FIRA bundle (user_id=%s, bank_reference=%s)",
             current_user.id,
             payload.transaction_id,
         )
         raise
 
     db.refresh(log_entry)
-    return EFiraBundleResponse(id=log_entry.id, bundle_hash=log_entry.bundle_hash, bundle=log_entry.bundle_payload)
+    return EFiraBundleResponse(
+        id=log_entry.id,
+        bundle_hash=log_entry.bundle_hash,
+        bundle=log_entry.bundle_payload,
+    )
 
 
 @router.get("/efira/{bundle_id}", response_model=EFiraBundleResponse)
@@ -125,20 +154,24 @@ async def get_efira_log(
     db: Session = Depends(get_db),
 ) -> EFiraBundleResponse:
     """
-    Retrieve a previously-generated bundle. Ownership is checked via the
-    bundle's linked transaction (EFiraLog has no user_id column of its
-    own -- see the model), not a direct column comparison, but the
-    uniform-404 result for "doesn't exist" vs. "isn't yours" is identical
-    either way.
+    Retrieve a previously generated bundle.
+
+    Ownership is checked through the linked payment, because EFiraLog has
+    no user_id column of its own. The uniform 404 covers both "does not
+    exist" and "is not yours".
     """
     log_entry = db.execute(select(EFiraLog).where(EFiraLog.id == bundle_id)).scalar_one_or_none()
     if log_entry is None:
         raise HTTPException(status_code=404, detail="Bundle not found.")
 
-    transaction = db.execute(
-        select(TransactionLedger).where(TransactionLedger.id == log_entry.transaction_id)
+    payment = db.execute(
+        select(InboundPayment).where(InboundPayment.id == log_entry.transaction_id)
     ).scalar_one_or_none()
-    if transaction is None or transaction.user_id != current_user.id:
+    if payment is None or payment.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Bundle not found.")
 
-    return EFiraBundleResponse(id=log_entry.id, bundle_hash=log_entry.bundle_hash, bundle=log_entry.bundle_payload)
+    return EFiraBundleResponse(
+        id=log_entry.id,
+        bundle_hash=log_entry.bundle_hash,
+        bundle=log_entry.bundle_payload,
+    )

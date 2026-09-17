@@ -55,7 +55,8 @@ class Settings(BaseSettings):
     # or an unhandled-exception traceback. Consumers call
     # .get_secret_value() before use -- core/encryption.py's
     # _decoded_key() will need that one-line update to match this type.
-    #
+    BANK_WEBHOOK_HMAC_SECRET: SecretStr | None = None
+    CORS_ALLOWED_ORIGINS: list[str] = ["*"]
     # Placeholder status: production should source this from a managed KMS
     # via envelope encryption rather than a static .env value -- see the
     # KEY MANAGEMENT note in core/encryption.py.

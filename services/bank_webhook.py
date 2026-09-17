@@ -1,31 +1,24 @@
 """
 Services: bank_webhook.py
-Handles incoming signals from partner banks, verifying idempotency and initiating the ledger entry.
 
-SCOPE NOTE: this file starts from an already-parsed JSON payload (dict)
-and an already-extracted idempotency_key. HMAC-SHA256 signature
-verification of the raw request body happens strictly BEFORE JSON
-parsing, in the API route (not built yet) -- by the time payload/
-idempotency_key reach this function, the signature has already been
-checked upstream. This file has no raw request bytes to verify against
-and isn't the right layer to do it even if it did.
+Processes a payment signal from the partner bank.
 
-PAYLOAD ASSUMPTION FLAG: the brief only confirmed 'amount' and 'currency'
-as payload keys. Building a valid TransactionLedger row also needs a way
-to identify which platform user the funds belong to, an FX rate, and a
-compliance purpose code -- none of those were specified, and none are
-invented as dummy values here. The extraction below assumes 'recipient_
-account', 'exchange_rate', and 'purpose_code' as the additional keys;
-treat those three names as placeholders to confirm against the real bank
-message format, not as settled fact. base_usd_exchange_rate in particular
-is worth a second look: it's assumed here to come from the bank's own
-payload, but since ledger_model.py documents it as existing purely for
-independent dashboard reporting, sourcing it from an independent market
-FX feed instead of the bank's self-reported rate may be the better design
--- flagging rather than deciding that here.
+WHAT THIS DOES: resolves which customer the money belongs to, records the
+payment, and tries to match it against a pre-declaration.
+
+WHAT THIS NO LONGER DOES, and must not do again: calculate a margin,
+dispatch a settlement, or move anything. Those belonged to an earlier
+design in which this platform held funds. The bank credits its own
+customer; we record that it happened.
+
+SCOPE: this function receives an already-parsed payload. HMAC verification
+against the raw request bytes happens upstream in api/b2b_routes.py,
+before JSON parsing, and that ordering is the entire point — a signature
+checked after parsing has already let a forged payload through the parser.
 """
 import logging
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -33,266 +26,269 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from models.ledger_model import TransactionLedger
+from models.declaration_model import Declaration
+from models.payment_model import InboundPayment
 from models.user_model import User
 from models.virtual_account_model import VirtualAccount
-from services.margin_engine import calculate_transaction_splits
-from services.settlement_engine import dispatch_settlement
 
 logger = logging.getLogger(__name__)
 
+# How far the amount may differ from a pre-declaration and still match.
+# Intermediary banks deduct their own charges in transit, so the amount
+# that lands is routinely a little under what the payer sent. Too tight
+# and nothing ever matches; too loose and a declaration attaches itself
+# to an unrelated payment of similar size.
+_AMOUNT_TOLERANCE = Decimal("0.02")
+
 
 class WebhookProcessingError(Exception):
-    """Base class for business-logic rejections of a bank signal, as opposed to unexpected infrastructure failures (DB connectivity, etc.), which propagate as whatever they naturally are."""
+    """Business-logic rejection of a bank signal. Infrastructure failures propagate as themselves."""
 
 
 class MalformedPayloadError(WebhookProcessingError):
-    """The payload is missing a required field, or a field's value can't be parsed into the type it needs to be."""
+    """A required field is missing, or a value cannot be parsed into the type it needs."""
 
 
 class UnrecognizedAccountError(WebhookProcessingError):
-    """The payload's account identifier doesn't match any known VirtualAccount.account_number."""
+    """The account identifier matches no known VirtualAccount."""
 
 
 @dataclass(frozen=True, slots=True)
-class WebhookProcessingResult:
-    """
-    ledger_entry: the TransactionLedger row for this idempotency_key --
-    either newly created, or the pre-existing one if this call was a
-    replay of an already-processed signal.
-    was_duplicate: lets the future API layer distinguish "just created"
-    (e.g. respond 201) from "already existed, here it is again" (e.g.
-    respond 200) without querying anything itself.
-    """
-    ledger_entry: TransactionLedger
+class WebhookResult:
+    payment: InboundPayment
     was_duplicate: bool
+    matched_declaration: Declaration | None
 
 
-def _resolve_recipient(db: Session, account_number: str) -> User:
+def _require(payload: dict[str, Any], key: str) -> Any:
+    if key not in payload or payload[key] is None:
+        raise MalformedPayloadError(f"Payload is missing required field {key!r}.")
+    return payload[key]
+
+
+def _to_decimal(value: Any, field: str) -> Decimal:
     """
-    Look up which platform user this signal's funds belong to.
+    Parse to Decimal via str.
 
-    Two queries, not a join: VirtualAccount -> User, matching this
-    codebase's established style everywhere else (no ORM relationship()
-    objects, explicit selects at the call site) rather than introducing a
-    join pattern used nowhere else in this project. This isn't a hot
-    path -- a webhook handler, not a request loop -- so the extra
-    round-trip costs nothing that matters.
-
-    scalar_one_or_none() rather than .first(): account_number is
-    unique=True on VirtualAccount, so at most one row can ever match.
-    Using the "exactly zero or one" method makes that assumption explicit
-    and self-verifying -- if it's ever violated (a data integrity
-    problem, not something that should be possible), this raises loudly
-    instead of .first() silently picking one of several matches and
-    hiding the bug.
+    Decimal(str(value)) rather than Decimal(value): if the JSON parser
+    produced a float, Decimal(float) preserves the binary representation
+    error exactly, so 0.1 becomes 0.1000000000000000055511151231257827.
+    Going through str truncates at the decimal representation, which is
+    the value the bank actually meant.
     """
-    virtual_account = db.execute(
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        raise MalformedPayloadError(f"Field {field!r} is not a valid decimal: {value!r}.")
+    if parsed <= 0:
+        raise MalformedPayloadError(f"Field {field!r} must be positive, got {parsed}.")
+    return parsed
+
+
+def _resolve_account(db: Session, account_number: str) -> tuple[VirtualAccount, User]:
+    """
+    Find the virtual account and its owner.
+
+    Two queries rather than a join, matching this codebase's style
+    elsewhere. A webhook handler is not a hot path, so the extra round
+    trip costs nothing worth optimising away.
+
+    scalar_one_or_none rather than first(): account_number is unique, so
+    at most one row can match. If that is ever violated it is a data
+    integrity problem, and this raises loudly instead of silently picking
+    one of several.
+    """
+    account = db.execute(
         select(VirtualAccount).where(VirtualAccount.account_number == account_number)
     ).scalar_one_or_none()
-    if virtual_account is None:
+    if account is None:
         raise UnrecognizedAccountError(
-            f"No VirtualAccount found with account_number={account_number!r} -- "
-            "this webhook references an account the platform doesn't recognize."
+            f"No virtual account matches {account_number!r}. This signal references an account we do not know."
         )
 
-    user = db.execute(select(User).where(User.id == virtual_account.user_id)).scalar_one_or_none()
+    user = db.execute(select(User).where(User.id == account.user_id)).scalar_one_or_none()
     if user is None:
-        # Should be unreachable given VirtualAccount.user_id's
-        # ondelete=RESTRICT -- a VirtualAccount row can't outlive the User
-        # it points to. Raised explicitly anyway rather than trusting
-        # that guarantee silently: "should be unreachable" and "is
-        # unreachable" aren't the same claim, and a data integrity
-        # problem here deserves a loud failure, not a None slipping
-        # further into this function.
         raise UnrecognizedAccountError(
-            f"VirtualAccount {account_number!r} references user_id={virtual_account.user_id}, "
-            "but no such user exists -- this indicates a data integrity problem, not a "
-            "normal rejection."
+            f"Virtual account {account_number!r} points to user_id={account.user_id}, which does not exist. "
+            "This is a data integrity problem, not a normal rejection."
         )
-    return user
+    return account, user
 
 
-def process_bank_signal(db: Session, payload: dict[str, Any], idempotency_key: str) -> WebhookProcessingResult:
+def _find_matching_declaration(
+    db: Session, user: User, amount: Decimal, currency: str
+) -> Declaration | None:
     """
-    Process one bank webhook signal: resolve the recipient, run the
-    amount through margin_engine, and stage a PENDING TransactionLedger
-    row -- idempotently.
+    Look for an open pre-declaration this payment plausibly satisfies.
 
-    HOW IDEMPOTENCY IS ENFORCED
-    ----------------------------
-    idempotency_key becomes transaction_reference, which is unique=True
-    on TransactionLedger. The actual guarantee is that DB-level unique
-    constraint, not application logic -- application logic only has to
-    cooperate with it correctly, via two layers:
+    Matching is deliberately conservative. A wrong match is worse than no
+    match: it attaches a purpose code the customer did not intend to money
+    they did not mean it for, and the bank files that with RBI. When in
+    doubt, return None and let the payment arrive undeclared, which is the
+    status quo and harms nothing.
 
-    1. Fast path: a plain SELECT by transaction_reference, first thing in
-       this function. If a row's already there, return it immediately --
-       no point spending a DB round-trip resolving the user or running
-       the fee/split math for a signal we've already processed.
-
-    2. The actual guarantee: even after the fast path finds nothing, this
-       function still INSERTS first and only finds out it lost a race via
-       a caught IntegrityError, rather than trusting the fast-path SELECT
-       as proof nothing exists. A "SELECT to check, then INSERT if
-       missing" approach LOOKS sufficient but has a real race window: two
-       concurrent calls for the same idempotency_key (a genuine
-       possibility -- bank retries and near-simultaneous redeliveries are
-       exactly what idempotency exists to handle) can both pass the
-       SELECT before either commits, and then both attempt to insert.
-       Only the database's unique constraint can arbitrate that atomically;
-       no amount of application-level checking before the write can.
-
-    When the INSERT does lose that race, IntegrityError is caught, the
-    session is rolled back (mandatory -- a session can't be reused after
-    a failed flush without rolling back first), and the row is re-queried
-    by transaction_reference to return the winner's copy with
-    was_duplicate=True. That re-query is also what keeps this from
-    mishandling a DIFFERENT constraint violation: IntegrityError isn't
-    unique to the idempotency case -- a bad user_id FK, or the revenue-
-    split / exchange-rate CHECK constraints firing from a margin_engine
-    bug, would ALSO raise IntegrityError. If the re-query finds nothing,
-    it wasn't a duplicate; the exception is re-raised rather than
-    silently treated as "just a retry".
+    Criteria: same user, same currency, still FILED, not past its expected
+    date, amount within tolerance. Oldest first, so a customer with two
+    similar open declarations gets the one they have been waiting on
+    longest.
     """
-    # --- Idempotency fast path -----------------------------------------
+    lower = amount * (Decimal("1") - _AMOUNT_TOLERANCE)
+    upper = amount * (Decimal("1") + _AMOUNT_TOLERANCE)
+
+    candidates = db.execute(
+        select(Declaration)
+        .where(
+            Declaration.user_id == user.id,
+            Declaration.kind == "PRE_PAYMENT",
+            Declaration.status == "FILED",
+            Declaration.currency == currency,
+            Declaration.expected_amount >= lower,
+            Declaration.expected_amount <= upper,
+            Declaration.expected_by >= date.today(),
+        )
+        .order_by(Declaration.created_at.asc())
+    ).scalars().all()
+
+    if not candidates:
+        return None
+
+    if len(candidates) > 1:
+        # Ambiguity resolved by not resolving it. Two open declarations of
+        # similar size means we cannot tell which this payment satisfies,
+        # and guessing would file a purpose code on a coin flip.
+        logger.info(
+            "Payment of %s %s for user_id=%s matches %d open declarations. Leaving unmatched.",
+            amount,
+            currency,
+            user.id,
+            len(candidates),
+        )
+        return None
+
+    return candidates[0]
+
+
+def process_bank_signal(
+    db: Session, payload: dict[str, Any], bank_reference: str
+) -> WebhookResult:
+    """
+    Record one inbound payment.
+
+    IDEMPOTENCY: bank_reference is unique. A redelivered signal — and
+    banks redeliver, on timeout, on retry, on operator action — finds the
+    existing row and returns it rather than creating a second record of
+    the same money. The unique constraint is the guarantee; the lookup
+    below is the fast path.
+    """
     existing = db.execute(
-        select(TransactionLedger).where(TransactionLedger.transaction_reference == idempotency_key)
+        select(InboundPayment).where(InboundPayment.bank_reference == bank_reference)
     ).scalar_one_or_none()
     if existing is not None:
-        return WebhookProcessingResult(ledger_entry=existing, was_duplicate=True)
+        logger.info("Replay of bank_reference=%s, returning existing payment.", bank_reference)
+        return WebhookResult(payment=existing, was_duplicate=True, matched_declaration=None)
 
-    # --- Extract & validate payload fields -------------------------------
-    # Decimal(str(x)), never Decimal(x), for anything that came out of
-    # parsed JSON: a bare JSON numeric literal (1234.56, not "1234.56")
-    # parses into a Python float, and Decimal(that_float) captures the
-    # float's exact binary imprecision (Decimal(1234.56) is actually
-    # Decimal('1234.55999999999994543031789362430572509765625')) --
-    # exactly the kind of silent corruption Numeric(18, 4)/Decimal
-    # elsewhere in this codebase exists to prevent. Decimal(str(x)) goes
-    # through the clean decimal string instead. The real fix belongs one
-    # layer up, in whatever parses the raw webhook body (json.loads(...,
-    # parse_float=Decimal)) -- this is the defensive fallback for this
-    # function specifically, in case that upstream fix isn't in place.
-    try:
-        gross_amount = Decimal(str(payload["amount"]))
-        source_currency = str(payload["currency"]).strip().upper()
-        recipient_account_number = str(payload["recipient_account"]).strip()
-        base_usd_exchange_rate = Decimal(str(payload["exchange_rate"]))
-        compliance_purpose_code = str(payload["purpose_code"]).strip()
-    except (KeyError, InvalidOperation, TypeError) as exc:
-        raise MalformedPayloadError(f"Webhook payload missing or malformed field: {exc}") from exc
+    account_number = str(_require(payload, "account_number")).strip()
+    amount = _to_decimal(_require(payload, "amount"), "amount")
 
-    if len(source_currency) != 3:
-        raise MalformedPayloadError(f"currency must be a 3-letter ISO 4217 code, got {source_currency!r}.")
-    if base_usd_exchange_rate <= 0:
-        raise MalformedPayloadError(f"exchange_rate must be positive, got {base_usd_exchange_rate}.")
+    currency = str(_require(payload, "currency")).strip().upper()
+    if len(currency) != 3:
+        raise MalformedPayloadError(f"currency must be a 3-letter ISO 4217 code, got {currency!r}.")
 
-    # --- Fee/tax/split math (pure, no DB access -- fails fast on a bad
-    # amount before spending a round-trip on the user lookup below) ------
-    split = calculate_transaction_splits(gross_amount)
+    account, user = _resolve_account(db, account_number)
 
-    # --- Resolve which platform user this signal belongs to -------------
-    recipient = _resolve_recipient(db, recipient_account_number)
+    declaration = _find_matching_declaration(db, user, amount, currency)
 
-    # --- Stage and attempt the insert ------------------------------------
-    new_entry = TransactionLedger(
-        transaction_reference=idempotency_key,
-        user_id=recipient.id,
-        status="PENDING",
-        gross_amount=split.gross_amount,
-        source_currency=source_currency,
-        base_usd_exchange_rate=base_usd_exchange_rate,
-        platform_fee_charged=split.platform_fee_charged,
-        tax_collected=split.tax_collected,
-        net_platform_revenue=split.net_platform_revenue,
-        partner_bank_revenue=split.partner_bank_revenue,
-        compliance_purpose_code=compliance_purpose_code,
+    payment = InboundPayment(
+        bank_reference=bank_reference,
+        user_id=user.id,
+        virtual_account_id=account.id,
+        status="RECEIVED",
+        amount=amount,
+        currency=currency,
+        payer_name=(str(payload["payer_name"]).strip() if payload.get("payer_name") else None),
+        payer_country=(
+            str(payload["payer_country"]).strip().upper() if payload.get("payer_country") else None
+        ),
+        # Taken from the declaration where one matched. The bank confirms
+        # or overrides it — we suggest, they file.
+        purpose_code=(declaration.purpose_code if declaration else None),
+        declaration_id=(declaration.id if declaration else None),
+        bank_remark=(str(payload["remark"]).strip() if payload.get("remark") else None),
     )
 
     try:
-        db.add(new_entry)
+        db.add(payment)
+        db.flush()
+
+        if declaration is not None:
+            declaration.status = "MATCHED"
+            declaration.matched_payment_id = payment.id
+            declaration.matched_at = payment.received_at
+
         db.commit()
     except IntegrityError:
+        # Two concurrent deliveries of the same signal. Both passed the
+        # lookup above; one wins the insert. Re-read and return the
+        # winner's row rather than failing the loser's request, because
+        # from the bank's perspective the payment was recorded either way.
         db.rollback()
-        existing = db.execute(
-            select(TransactionLedger).where(TransactionLedger.transaction_reference == idempotency_key)
+        winner = db.execute(
+            select(InboundPayment).where(InboundPayment.bank_reference == bank_reference)
         ).scalar_one_or_none()
-        if existing is not None:
-            # Confirmed: a concurrent call for this exact idempotency_key
-            # won the race and committed first. This IS the idempotency
-            # guarantee working as designed, not a failure.
-            return WebhookProcessingResult(ledger_entry=existing, was_duplicate=True)
-        # No row exists for this transaction_reference, so the
-        # IntegrityError was caused by something else entirely (bad FK,
-        # a CHECK constraint tripped by bad data). Don't mask a real
-        # failure as a benign retry.
+        if winner is not None:
+            return WebhookResult(payment=winner, was_duplicate=True, matched_declaration=None)
         raise
     except Exception:
-        # Anything else unexpected mid-write: roll back so this session
-        # isn't left holding a half-open transaction for whatever runs
-        # next on it, then propagate -- this function doesn't try to
-        # interpret failures it has no specific handling for.
         db.rollback()
+        logger.exception("Failed to record payment bank_reference=%s", bank_reference)
         raise
 
-    db.refresh(new_entry)  # populate id / created_at, generated server-side, before handing the row back
-    return WebhookProcessingResult(ledger_entry=new_entry, was_duplicate=False)
+    db.refresh(payment)
+    return WebhookResult(payment=payment, was_duplicate=False, matched_declaration=declaration)
 
 
-def trigger_settlement_dispatch(db: Session, result: WebhookProcessingResult) -> None:
+def apply_status_update(
+    db: Session, bank_reference: str, payload: dict[str, Any]
+) -> InboundPayment:
     """
-    Called by the route layer (api/b2b_routes.py) AFTER process_bank_signal
-    returns successfully -- deliberately a SEPARATE function, not folded
-    into process_bank_signal itself. That function is the most tested,
-    most proven piece of this entire codebase (idempotent, exhaustively
-    verified split math); adding settlement dispatch to its own body would
-    mean modifying it for a concern that has nothing to do with what makes
-    it correct. This function sits right next to it instead, callable by
-    both /b2b/bank-webhook and /b2b/decentro-callback without either
-    duplicating this logic.
+    Apply a status change the bank reported for a payment we already hold.
 
-    was_duplicate SKIPS dispatch entirely, not just avoids redundant work:
-    a duplicate means process_bank_signal found a pre-existing row for
-    this idempotency_key, which means dispatch already ran (or is running)
-    for it via the ORIGINAL, non-duplicate call. Re-dispatching here would
-    at best be a guaranteed no-op (mint_digital_currency/
-    execute_fiat_settlement both refuse a non-PENDING row) and at worst a
-    race against a dispatch still in flight -- skipping is correct
-    behavior, not an optimization.
-
-    Exceptions from dispatch_settlement are caught and logged here, NOT
-    re-raised: by the time this function is even called, the webhook's own
-    job -- correctly recording that a payment signal was received -- has
-    already succeeded and committed. A downstream orchestration failure
-    shouldn't turn into a 500 returned to the bank; retrying the webhook
-    wouldn't even help, since the retry would immediately hit was_duplicate
-    and skip dispatch again. What this DOES mean: a ledger row can be left
-    genuinely stuck PENDING with funds already received and no automatic
-    retry to un-stick it -- a real, human-actionable problem, which is
-    exactly why this is logged loudly rather than swallowed silently.
+    The bank tells us it credited, held, or returned the money. We write
+    down what it said. There is no state machine here validating which
+    transitions are legal, and that is deliberate: the bank's systems are
+    the authority on the lifecycle of its own payment, and a client-side
+    machine that disagrees would be wrong by construction.
     """
-    if result.was_duplicate:
-        return
+    payment = db.execute(
+        select(InboundPayment).where(InboundPayment.bank_reference == bank_reference)
+    ).scalar_one_or_none()
+    if payment is None:
+        raise UnrecognizedAccountError(
+            f"No payment recorded for bank_reference={bank_reference!r}."
+        )
 
-    try:
-        outcome = dispatch_settlement(db, result.ledger_entry)
-    except Exception:
-        logger.exception(
-            "Unexpected failure during settlement dispatch for ledger_entry_id=%s -- funds received, "
-            "settlement not completed, no automatic retry exists yet.",
-            result.ledger_entry.id,
-        )
-        return
+    new_status = str(_require(payload, "status")).strip().upper()
+    if new_status not in ("RECEIVED", "CREDITED", "RETURNED", "ON_HOLD"):
+        raise MalformedPayloadError(f"Unrecognised status {new_status!r}.")
 
-    if not outcome.dispatched:
-        logger.warning(
-            "Settlement not dispatched for ledger_entry_id=%s: %s", result.ledger_entry.id, outcome.reason
+    payment.status = new_status
+
+    if payload.get("credited_amount_inr") is not None:
+        payment.credited_amount_inr = _to_decimal(
+            payload["credited_amount_inr"], "credited_amount_inr"
         )
-    elif not outcome.success:
-        logger.error(
-            "Settlement dispatched but failed for ledger_entry_id=%s (%s rail): %s",
-            result.ledger_entry.id,
-            outcome.rail,
-            outcome.reason,
-        )
+    if payload.get("exchange_rate") is not None:
+        payment.exchange_rate = _to_decimal(payload["exchange_rate"], "exchange_rate")
+    if payload.get("purpose_code"):
+        # The bank's own classification overrides whatever we suggested
+        # from the declaration. Theirs is the one filed with RBI.
+        payment.purpose_code = str(payload["purpose_code"]).strip().upper()
+    if payload.get("fira_reference"):
+        payment.fira_reference = str(payload["fira_reference"]).strip()
+        payment.fira_issued_at = payment.updated_at
+    if payload.get("remark"):
+        payment.bank_remark = str(payload["remark"]).strip()
+
+    db.commit()
+    db.refresh(payment)
+    return payment
